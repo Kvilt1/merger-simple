@@ -1,0 +1,6 @@
+input/
+.claude/
+output/
+
+__pycache__/
+*.pyc
