@@ -903,7 +903,8 @@ def main():
     # --- Step 4: Perform Media Mapping ---
     logging.info("Starting media mapping process...")
 
-    mapping: Dict[str, Dict[int, List[str]]] = {conv_id: {} for conv_id in conversations}
+    # Enhanced mapping structure to store metadata
+    mapping: Dict[str, Dict[int, List[Dict[str, Any]]]] = {conv_id: {} for conv_id in conversations}
     mapped_files = set()
 
     # A. Media ID Mapping
@@ -916,9 +917,17 @@ def main():
                 for media_id in media_ids:
                     if media_id in media_index:
                         filename = media_index[media_id]
+                        # Check if it's a folder (multipart/grouped)
+                        is_grouped = filename.endswith("_multipart") or filename.endswith("_grouped")
+                        
                         if i not in mapping[conv_id]:
                             mapping[conv_id][i] = []
-                        mapping[conv_id][i].append(filename)
+                        mapping[conv_id][i].append({
+                            "filename": filename,
+                            "mapping_method": "media_id",
+                            "time_diff_seconds": None,
+                            "is_grouped": is_grouped
+                        })
                         mapped_files.add(filename)
 
     logging.info(f"Mapped {len(mapped_files)} files using Media IDs.")
@@ -989,7 +998,14 @@ def main():
             conv_id, msg_idx, _ = best_match
             if msg_idx not in mapping[conv_id]:
                 mapping[conv_id][msg_idx] = []
-            mapping[conv_id][msg_idx].append(filename)
+            # Convert milliseconds to seconds for time_diff
+            time_diff_seconds = min_diff / 1000.0
+            mapping[conv_id][msg_idx].append({
+                "filename": filename,
+                "mapping_method": "timestamp",
+                "time_diff_seconds": round(time_diff_seconds, 1),
+                "is_grouped": False  # Individual MP4s are not grouped
+            })
             mapped_files.add(filename)
             mp4_matches += 1
     
@@ -1011,8 +1027,15 @@ def main():
             conv_id, msg_idx, _ = best_match
             if msg_idx not in mapping[conv_id]:
                 mapping[conv_id][msg_idx] = []
+            # Convert milliseconds to seconds for time_diff
+            time_diff_seconds = min_diff / 1000.0
             # Add the entire folder as a single unit
-            mapping[conv_id][msg_idx].append(folder_name)
+            mapping[conv_id][msg_idx].append({
+                "filename": folder_name,
+                "mapping_method": "timestamp",
+                "time_diff_seconds": round(time_diff_seconds, 1),
+                "is_grouped": True  # Folders are grouped
+            })
             mapped_files.add(folder_name)
             folder_matches += 1
 
@@ -1049,20 +1072,56 @@ def main():
 
         for msg_idx, items in mapping.get(conv_id, {}).items():
             if msg_idx < len(conversations[conv_id]):
-                conversations[conv_id][msg_idx]["media_locations"] = [f"media/{item}" for item in items]
-                for item_name in items:
+                # Extract metadata from the enhanced mapping structure
+                media_locations = []
+                matched_media_files = []
+                is_grouped = False
+                mapping_method = None
+                time_diff_seconds = None
+                
+                for item_metadata in items:
+                    filename = item_metadata["filename"]
+                    is_grouped = item_metadata["is_grouped"]
+                    mapping_method = item_metadata["mapping_method"]
+                    
+                    # Only include time_diff for timestamp mappings
+                    if mapping_method == "timestamp":
+                        time_diff_seconds = item_metadata["time_diff_seconds"]
+                    
+                    # Handle media locations
+                    if is_grouped:
+                        media_locations.append(f"media/{filename}/")
+                    else:
+                        media_locations.append(f"media/{filename}")
+                    
+                    # Copy files to destination
                     media_output_dir = conv_output_dir / "media"
                     ensure_directory(media_output_dir)
-                    source_path = temp_media_dir / item_name
-                    dest_path = media_output_dir / item_name
+                    source_path = temp_media_dir / filename
+                    dest_path = media_output_dir / filename
                     
                     if source_path.exists() and not dest_path.exists():
                         if source_path.is_file():
                             # Copy individual file
                             shutil.copy(source_path, dest_path)
+                            matched_media_files.append(filename)
                         elif source_path.is_dir():
                             # Copy entire folder for multi-part videos
                             shutil.copytree(source_path, dest_path)
+                            # List all files in the folder for matched_media_files (excluding timestamps.json)
+                            for file in source_path.iterdir():
+                                if file.is_file() and file.name != "timestamps.json":
+                                    matched_media_files.append(file.name)
+                
+                # Add all metadata fields to the message
+                conversations[conv_id][msg_idx]["media_locations"] = media_locations
+                conversations[conv_id][msg_idx]["matched_media_files"] = matched_media_files
+                conversations[conv_id][msg_idx]["is_grouped"] = is_grouped
+                conversations[conv_id][msg_idx]["mapping_method"] = mapping_method
+                
+                # Only add time_diff_seconds if it exists (timestamp mapping)
+                if time_diff_seconds is not None:
+                    conversations[conv_id][msg_idx]["time_diff_seconds"] = time_diff_seconds
 
         save_json({
             "conversation_metadata": metadata,
