@@ -1,12 +1,76 @@
-# Ignore output and input directories/files
-output/
-input/
-
-# Ignore Python cache files and directories
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.Python
+env/
+venv/
+.venv
 *.pyo
 *.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
 
-# Ignore environment files
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.spyderproject
+.spyproject
+.ropeproject
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+
+# Project specific
+input/
+output/
+temp_media/
+*.mp4
+*.png
+*.jpeg
+*.jpg
+*.webp
+*.json
+!src/**/*.py
+!timestamps.json
+
+# Logs
+*.log
+logs/
+
+# Environment
 .env
+.env.local
+
+# Snapchat data (sensitive)
+mydata/
+chat_media/
+json/
+memories/
+
+# Backup files
+*.old
+*.bak
+*.backup
+
+# Claude/AI
+.claude/
+.serena/
+claudedocs/
+.DS_Store
