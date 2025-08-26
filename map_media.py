@@ -19,7 +19,7 @@ from utils import load_json, save_json, ensure_directory
 # You can adjust these settings
 INPUT_DIR = Path("input")
 OUTPUT_DIR = Path("output")
-TIMESTAMP_THRESHOLD_SECONDS = 10  # How close an MP4's time must be to a message's time
+TIMESTAMP_THRESHOLD_SECONDS = 60  # How close an MP4's time must be to a message's time
 QUICKTIME_EPOCH_ADJUSTER = 2082844800 # Seconds between QuickTime epoch (1904) and Unix epoch (1970)
 
 # Configure logging
@@ -82,6 +82,168 @@ def merge_overlay_pairs(source_dir: Path, temp_dir: Path) -> set:
                         merged_source_files.add(overlay_file.name)
                     merged_count += 1
                     logging.info(f"Successfully processed multi-part video: {folder_name}")
+            else:
+                # NEW CASE 3: Multiple non-identical overlays
+                logging.info(f"Detected multiple non-identical overlays for {date_str}: {len(overlays)} overlays, {len(medias)} media files")
+                
+                # Group overlays by hash
+                overlay_groups = group_overlays_by_hash(overlays)
+                logging.info(f"Found {len(overlay_groups)} unique overlay groups")
+                
+                # Group media files by timestamp
+                media_groups = extract_and_group_media_by_timestamp(medias, TIMESTAMP_THRESHOLD_SECONDS)
+                logging.info(f"Found {len(media_groups)} media timestamp groups")
+                
+                # Match groups based on count
+                matched_groups = match_overlay_and_media_groups(overlay_groups, media_groups)
+                logging.info(f"Successfully matched {len(matched_groups)} group pairs")
+                
+                # Process each matched group
+                for overlay_group, media_group in matched_groups:
+                    # Check if this is a single-file group
+                    if len(media_group) == 1 and len(overlay_group) == 1:
+                        # Handle as single file merge
+                        media_file = media_group[0]
+                        overlay_file = overlay_group[0]
+                        output_file = temp_dir / media_file.name
+                        
+                        logging.info(f"Processing single grouped file: {media_file.name} + {overlay_file.name}")
+                        
+                        try:
+                            command = [
+                                "ffmpeg",
+                                "-y",
+                                "-i", str(media_file),     # [0] base video
+                                "-i", str(overlay_file),   # [1] overlay (alpha)
+                                "-filter_complex",
+                                "[1:v][0:v]scale=w=rw:h=rh,format=rgba[ovr];[0:v][ovr]overlay=0:0:format=auto[vout]",
+                                "-map", "[vout]",          # map filtered video
+                                "-map", "0:a?",            # optional audio from base
+                                "-map_metadata", "0",      # copy all tags from base
+                                "-movflags", "+faststart",
+                                "-c:v", "libx264",
+                                "-preset", "veryfast",
+                                "-crf", "18",
+                                "-c:a", "copy",
+                                str(output_file),
+                            ]
+                            subprocess.run(command, check=True, capture_output=True, text=True)
+                            
+                            # Mark originals as processed
+                            merged_source_files.add(media_file.name)
+                            merged_source_files.add(overlay_file.name)
+                            
+                            # Preserve file times
+                            try:
+                                st = media_file.stat()
+                                os.utime(output_file, (st.st_atime, st.st_mtime))
+                            except Exception as e:
+                                logging.debug(f"Could not copy file times for {output_file.name}: {e}")
+                            
+                            merged_count += 1
+                            
+                        except subprocess.CalledProcessError as e:
+                            logging.error(f"FFmpeg failed for {media_file.name}: {e.stderr}")
+                        except Exception as e:
+                            logging.error(f"An error occurred during single grouped merge: {e}")
+                    else:
+                        # Handle as multi-file group (create folder)
+                        folder_name = process_grouped_multipart_video(
+                            date_str, media_group, overlay_group, temp_dir
+                        )
+                        
+                        if folder_name:
+                            # Mark files as processed
+                            for media_file in media_group:
+                                merged_source_files.add(media_file.name)
+                            for overlay_file in overlay_group:
+                                merged_source_files.add(overlay_file.name)
+                            merged_count += 1
+                            logging.info(f"Successfully processed grouped multi-part: {folder_name}")
+        
+        # Check for multiple files with mismatched counts (also try Case 3 logic)
+        elif len(overlays) > 1 and len(medias) > 1:
+            # Try the grouping approach even with mismatched counts
+            logging.info(f"Detected multiple files with mismatched counts for {date_str}: {len(overlays)} overlays, {len(medias)} media files")
+            
+            # Group overlays by hash
+            overlay_groups = group_overlays_by_hash(overlays)
+            logging.info(f"Found {len(overlay_groups)} unique overlay groups")
+            
+            # Group media files by timestamp
+            media_groups = extract_and_group_media_by_timestamp(medias, TIMESTAMP_THRESHOLD_SECONDS)
+            logging.info(f"Found {len(media_groups)} media timestamp groups")
+            
+            # Match groups based on count
+            matched_groups = match_overlay_and_media_groups(overlay_groups, media_groups)
+            
+            if matched_groups:
+                logging.info(f"Successfully matched {len(matched_groups)} group pairs despite mismatched counts")
+                
+                # Process each matched group
+                for overlay_group, media_group in matched_groups:
+                    # Check if this is a single-file group
+                    if len(media_group) == 1 and len(overlay_group) == 1:
+                        # Handle as single file merge
+                        media_file = media_group[0]
+                        overlay_file = overlay_group[0]
+                        output_file = temp_dir / media_file.name
+                        
+                        logging.info(f"Processing single grouped file: {media_file.name} + {overlay_file.name}")
+                        
+                        try:
+                            command = [
+                                "ffmpeg",
+                                "-y",
+                                "-i", str(media_file),     # [0] base video
+                                "-i", str(overlay_file),   # [1] overlay (alpha)
+                                "-filter_complex",
+                                "[1:v][0:v]scale=w=rw:h=rh,format=rgba[ovr];[0:v][ovr]overlay=0:0:format=auto[vout]",
+                                "-map", "[vout]",          # map filtered video
+                                "-map", "0:a?",            # optional audio from base
+                                "-map_metadata", "0",      # copy all tags from base
+                                "-movflags", "+faststart",
+                                "-c:v", "libx264",
+                                "-preset", "veryfast",
+                                "-crf", "18",
+                                "-c:a", "copy",
+                                str(output_file),
+                            ]
+                            subprocess.run(command, check=True, capture_output=True, text=True)
+                            
+                            # Mark originals as processed
+                            merged_source_files.add(media_file.name)
+                            merged_source_files.add(overlay_file.name)
+                            
+                            # Preserve file times
+                            try:
+                                st = media_file.stat()
+                                os.utime(output_file, (st.st_atime, st.st_mtime))
+                            except Exception as e:
+                                logging.debug(f"Could not copy file times for {output_file.name}: {e}")
+                            
+                            merged_count += 1
+                            
+                        except subprocess.CalledProcessError as e:
+                            logging.error(f"FFmpeg failed for {media_file.name}: {e.stderr}")
+                        except Exception as e:
+                            logging.error(f"An error occurred during single grouped merge: {e}")
+                    else:
+                        # Handle as multi-file group (create folder)
+                        folder_name = process_grouped_multipart_video(
+                            date_str, media_group, overlay_group, temp_dir
+                        )
+                        
+                        if folder_name:
+                            # Mark files as processed
+                            for media_file in media_group:
+                                merged_source_files.add(media_file.name)
+                            for overlay_file in overlay_group:
+                                merged_source_files.add(overlay_file.name)
+                            merged_count += 1
+                            logging.info(f"Successfully processed grouped multi-part: {folder_name}")
+            else:
+                logging.warning(f"Could not match any groups for {date_str}")
         
         # Handle single media/overlay pairs
         elif len(medias) == 1 and len(overlays) == 1:
@@ -151,6 +313,244 @@ def are_overlays_identical(overlay_files: List[Path]) -> bool:
     
     # Check if all hashes are identical
     return len(set(hashes)) == 1
+
+def group_overlays_by_hash(overlay_files: List[Path]) -> Dict[str, List[Path]]:
+    """
+    Group overlay files by their content hash.
+    Returns a dictionary mapping hash to list of overlay files.
+    """
+    hash_groups = defaultdict(list)
+    
+    for overlay_file in overlay_files:
+        try:
+            with open(overlay_file, 'rb') as f:
+                file_hash = hashlib.md5(f.read()).hexdigest()
+                hash_groups[file_hash].append(overlay_file)
+        except Exception as e:
+            logging.error(f"Error hashing overlay file {overlay_file}: {e}")
+    
+    return dict(hash_groups)
+
+
+def extract_and_group_media_by_timestamp(media_files: List[Path], threshold_seconds: int) -> List[List[Path]]:
+    """
+    Group media files by their timestamps.
+    Files within threshold_seconds of each other are grouped together.
+    """
+    # Extract timestamps for all media files
+    media_with_timestamps = []
+    for media_file in media_files:
+        timestamp = extract_mp4_timestamp(media_file)
+        if timestamp:
+            media_with_timestamps.append((media_file, timestamp))
+        else:
+            logging.warning(f"Could not extract timestamp from {media_file.name}")
+    
+    # Sort by timestamp
+    media_with_timestamps.sort(key=lambda x: x[1])
+    
+    # Group files with close timestamps
+    groups = []
+    if media_with_timestamps:
+        current_group = [media_with_timestamps[0][0]]
+        current_timestamp = media_with_timestamps[0][1]
+        
+        for media_file, timestamp in media_with_timestamps[1:]:
+            # Check if within threshold (in milliseconds)
+            if abs(timestamp - current_timestamp) <= threshold_seconds * 1000:
+                current_group.append(media_file)
+            else:
+                groups.append(current_group)
+                current_group = [media_file]
+                current_timestamp = timestamp
+        
+        # Add the last group
+        groups.append(current_group)
+    
+    return groups
+
+
+def match_overlay_and_media_groups(
+    overlay_groups: Dict[str, List[Path]], 
+    media_groups: List[List[Path]]
+) -> List[Tuple[List[Path], List[Path]]]:
+    """
+    Match overlay groups with media groups based on file count.
+    Prioritizes unique count matches.
+    Returns list of (overlay_group, media_group) tuples.
+    """
+    # Convert overlay groups dict to list of groups
+    overlay_group_list = list(overlay_groups.values())
+    
+    # Create count-based dictionaries
+    overlay_counts = defaultdict(list)
+    for idx, group in enumerate(overlay_group_list):
+        overlay_counts[len(group)].append((idx, group))
+    
+    media_counts = defaultdict(list)
+    for idx, group in enumerate(media_groups):
+        media_counts[len(group)].append((idx, group))
+    
+    matched_pairs = []
+    used_overlay_indices = set()
+    used_media_indices = set()
+    
+    # First pass: match unique counts
+    for count in overlay_counts.keys():
+        if count in media_counts:
+            overlay_groups_with_count = overlay_counts[count]
+            media_groups_with_count = media_counts[count]
+            
+            # If both have exactly one group with this count, it's a unique match
+            if len(overlay_groups_with_count) == 1 and len(media_groups_with_count) == 1:
+                overlay_idx, overlay_group = overlay_groups_with_count[0]
+                media_idx, media_group = media_groups_with_count[0]
+                
+                if overlay_idx not in used_overlay_indices and media_idx not in used_media_indices:
+                    matched_pairs.append((overlay_group, media_group))
+                    used_overlay_indices.add(overlay_idx)
+                    used_media_indices.add(media_idx)
+                    logging.info(f"Matched unique group: {len(overlay_group)} overlays with {len(media_group)} media files")
+    
+    # Second pass: best-effort matching for non-unique counts
+    for count in overlay_counts.keys():
+        if count in media_counts:
+            overlay_groups_with_count = overlay_counts[count]
+            media_groups_with_count = media_counts[count]
+            
+            # Skip if already handled in first pass
+            if len(overlay_groups_with_count) == 1 and len(media_groups_with_count) == 1:
+                continue
+            
+            # Match remaining groups in order
+            for overlay_idx, overlay_group in overlay_groups_with_count:
+                if overlay_idx in used_overlay_indices:
+                    continue
+                    
+                for media_idx, media_group in media_groups_with_count:
+                    if media_idx in used_media_indices:
+                        continue
+                    
+                    matched_pairs.append((overlay_group, media_group))
+                    used_overlay_indices.add(overlay_idx)
+                    used_media_indices.add(media_idx)
+                    logging.warning(f"Best-effort match: {len(overlay_group)} overlays with {len(media_group)} media files (non-unique count)")
+                    break
+    
+    # Log unmatched groups
+    unmatched_overlays = len(overlay_group_list) - len(used_overlay_indices)
+    unmatched_media = len(media_groups) - len(used_media_indices)
+    if unmatched_overlays > 0 or unmatched_media > 0:
+        logging.warning(f"Unmatched groups: {unmatched_overlays} overlay groups, {unmatched_media} media groups")
+    
+    return matched_pairs
+
+
+def process_grouped_multipart_video(
+    date_str: str, 
+    media_files: List[Path], 
+    overlay_files: List[Path], 
+    temp_dir: Path
+) -> Optional[str]:
+    """
+    Process a matched group of media files and overlays.
+    Each media file gets merged with one overlay from the group.
+    Returns the folder name if successful, None otherwise.
+    """
+    if len(media_files) != len(overlay_files):
+        logging.error(f"Mismatch in group sizes: {len(media_files)} media files, {len(overlay_files)} overlay files")
+        return None
+    
+    # Sort both lists to ensure consistent pairing
+    media_files_sorted = sorted(media_files, key=lambda x: x.name)
+    overlay_files_sorted = sorted(overlay_files, key=lambda x: x.name)
+    
+    # Use latest media file for folder naming
+    latest_media = media_files_sorted[-1]
+    folder_name = latest_media.stem + "_grouped"
+    folder_path = temp_dir / folder_name
+    
+    try:
+        ensure_directory(folder_path)
+        
+        timestamps = {}
+        successful_parts = 0
+        
+        # Process each media-overlay pair
+        for media_file, overlay_file in zip(media_files_sorted, overlay_files_sorted):
+            output_filename = media_file.name
+            output_path = folder_path / output_filename
+            
+            logging.info(f"Processing grouped pair: {media_file.name} + {overlay_file.name}")
+            
+            try:
+                # Use the same FFmpeg command as other processing
+                command = [
+                    "ffmpeg",
+                    "-y",
+                    "-i", str(media_file),     # [0] base video
+                    "-i", str(overlay_file),   # [1] overlay (alpha)
+                    "-filter_complex",
+                    "[1:v][0:v]scale=w=rw:h=rh,format=rgba[ovr];[0:v][ovr]overlay=0:0:format=auto[vout]",
+                    "-map", "[vout]",          # map filtered video
+                    "-map", "0:a?",            # optional audio from base
+                    "-map_metadata", "0",      # copy all tags from base
+                    "-movflags", "+faststart",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-crf", "18",
+                    "-c:a", "copy",
+                    str(output_path),
+                ]
+                result = subprocess.run(command, capture_output=True, text=True)
+                
+                if result.returncode != 0:
+                    logging.error(f"FFmpeg failed for {media_file.name}")
+                    logging.error(f"FFmpeg stderr: {result.stderr}")
+                    continue
+                
+                # FFmpeg succeeded
+                successful_parts += 1
+                
+                # Extract timestamp for this part
+                timestamp = extract_mp4_timestamp(media_file)
+                if timestamp:
+                    # Convert to ISO format
+                    timestamp_seconds = timestamp / 1000
+                    dt = datetime.fromtimestamp(timestamp_seconds, tz=timezone.utc)
+                    timestamps[output_filename] = dt.isoformat().replace('+00:00', 'Z')
+                
+                # Preserve file times
+                try:
+                    st = media_file.stat()
+                    os.utime(output_path, (st.st_atime, st.st_mtime))
+                except Exception as e:
+                    logging.debug(f"Could not copy file times for {output_path.name}: {e}")
+                    
+            except Exception as e:
+                logging.error(f"Error processing {media_file.name}: {e}")
+                continue
+        
+        # Only create timestamps.json if we had successful merges
+        if successful_parts > 0:
+            timestamps_path = folder_path / "timestamps.json"
+            with open(timestamps_path, 'w') as f:
+                json.dump(timestamps, f, indent=2)
+            
+            logging.info(f"Created grouped multi-part video folder: {folder_name} with {successful_parts} successfully processed parts")
+            return folder_name
+        else:
+            # No successful parts, clean up
+            logging.error(f"No parts successfully processed for grouped multipart on {date_str}")
+            if folder_path.exists():
+                shutil.rmtree(folder_path)
+            return None
+        
+    except Exception as e:
+        logging.error(f"Error processing grouped multi-part video for {date_str}: {e}")
+        if folder_path.exists():
+            shutil.rmtree(folder_path)
+        return None
 
 
 def process_multipart_video(date_str: str, media_files: List[Path], overlay_file: Path, temp_dir: Path) -> Optional[str]:
@@ -319,7 +719,7 @@ def index_media_files(media_dir: Path, files_to_ignore: set) -> Dict[str, str]:
             media_id = extract_media_id_from_filename(item_path.name)
             if media_id:
                 media_index[media_id] = item_path.name
-        elif item_path.is_dir() and item_path.name.endswith("_multipart"):
+        elif item_path.is_dir() and (item_path.name.endswith("_multipart") or item_path.name.endswith("_grouped")):
             # For multi-part folders, index each file inside but map to the folder
             for file_path in item_path.iterdir():
                 if file_path.is_file() and file_path.suffix.lower() == '.mp4':
@@ -533,7 +933,7 @@ def main():
     
     # Collect multi-part folders that haven't been mapped yet
     unmapped_folders = [f for f in temp_media_dir.iterdir() 
-                       if f.is_dir() and f.name.endswith("_multipart")
+                       if f.is_dir() and (f.name.endswith("_multipart") or f.name.endswith("_grouped"))
                        and f.name not in mapped_files]
 
     mp4_timestamps: Dict[str, int] = {}
@@ -680,7 +1080,7 @@ def main():
             if item_path.is_file():
                 shutil.copy(str(item_path), str(orphaned_dir / item_path.name))
                 orphaned_count += 1
-            elif item_path.is_dir() and item_path.name.endswith("_multipart"):
+            elif item_path.is_dir() and (item_path.name.endswith("_multipart") or item_path.name.endswith("_grouped")):
                 # Copy entire orphaned multi-part folder
                 shutil.copytree(str(item_path), str(orphaned_dir / item_path.name))
                 orphaned_count += 1

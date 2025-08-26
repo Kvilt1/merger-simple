@@ -1,6 +1,12 @@
-input/
-.claude/
+# Ignore output and input directories/files
 output/
+input/
 
+# Ignore Python cache files and directories
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# Ignore environment files
+.env
