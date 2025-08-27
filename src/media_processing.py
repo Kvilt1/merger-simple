@@ -9,6 +9,7 @@ import shutil
 import struct
 import subprocess
 from collections import defaultdict
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple, Any
 
@@ -20,6 +21,19 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _ffmpeg_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
+    """
+    A picklable top-level worker function for FFmpeg merging.
+    On success, returns the original media filename and its extracted timestamp.
+    """
+    media_file, overlay_file, output_path = args
+    if run_ffmpeg_merge(media_file, overlay_file, output_path):
+        timestamp = extract_mp4_timestamp(media_file)
+        return (media_file.name, timestamp)
+    return None
+
 
 def run_ffmpeg_merge(media_file: Path, overlay_file: Path, output_file: Path) -> bool:
     """Merge media with overlay using FFmpeg."""
@@ -62,13 +76,28 @@ def calculate_file_hash(file_path: Path) -> Optional[str]:
     except Exception:
         return None
 
-def merge_overlay_pairs(source_dir: Path, temp_dir: Path) -> Set[str]:
-    """Find and merge media/overlay pairs."""
-    logger.info("Starting overlay merging process")
+def merge_overlay_pairs(source_dir: Path, temp_dir: Path) -> Tuple[Set[str], Dict[str, Any]]:
+    """Find and merge media/overlay pairs. Returns merged files and statistics."""
+    logger.info("=" * 60)
+    logger.info("Starting OVERLAY MERGING phase")
+    logger.info("=" * 60)
+    
+    stats = {
+        'total_media': 0,
+        'total_overlay': 0,
+        'simple_pairs_attempted': 0,
+        'simple_pairs_succeeded': 0,
+        'multipart_attempted': 0,
+        'multipart_succeeded': 0,
+        'grouped_attempted': 0,
+        'grouped_succeeded': 0,
+        'ffmpeg_errors': [],
+        'total_merged': 0
+    }
     
     if not shutil.which("ffmpeg"):
         logger.warning("FFmpeg not found. Skipping overlay merging.")
-        return set()
+        return set(), stats
     
     ensure_directory(temp_dir)
     
@@ -91,11 +120,14 @@ def merge_overlay_pairs(source_dir: Path, temp_dir: Path) -> Set[str]:
         
         if "_media~" in file_path.name:
             files_by_date[date_str]["media"].append(file_path)
+            stats['total_media'] += 1
         elif "_overlay~" in file_path.name:
             files_by_date[date_str]["overlay"].append(file_path)
+            stats['total_overlay'] += 1
+    
+    logger.info(f"Found {stats['total_media']} media files and {stats['total_overlay']} overlay files")
     
     merged_files = set()
-    merged_count = 0
     
     for date_str, files in files_by_date.items():
         media_files = files["media"]
@@ -103,71 +135,127 @@ def merge_overlay_pairs(source_dir: Path, temp_dir: Path) -> Set[str]:
         
         # Simple pair
         if len(media_files) == 1 and len(overlay_files) == 1:
+            stats['simple_pairs_attempted'] += 1
             output_file = temp_dir / media_files[0].name
             if run_ffmpeg_merge(media_files[0], overlay_files[0], output_file):
                 merged_files.add(media_files[0].name)
                 merged_files.add(overlay_files[0].name)
-                merged_count += 1
+                stats['simple_pairs_succeeded'] += 1
+                stats['total_merged'] += 1
+            else:
+                stats['ffmpeg_errors'].append(media_files[0].name)
         
         # Multi-part with identical overlays
         elif len(overlay_files) > 1 and len(media_files) == len(overlay_files):
             # Check if overlays identical
             hashes = [calculate_file_hash(f) for f in overlay_files]
             if len(set(h for h in hashes if h)) == 1:
-                folder_name = process_multipart(date_str, media_files, overlay_files[0], temp_dir)
+                stats['multipart_attempted'] += 1
+                folder_name, folder_stats = process_multipart(date_str, media_files, overlay_files[0], temp_dir)
                 if folder_name:
                     for f in media_files + overlay_files:
                         merged_files.add(f.name)
-                    merged_count += 1
+                    stats['multipart_succeeded'] += 1
+                    stats['total_merged'] += folder_stats['successful']
             else:
                 # Process groups with different overlays
-                result = process_grouped_overlays(date_str, media_files, overlay_files, temp_dir)
+                stats['grouped_attempted'] += 1
+                result, group_stats = process_grouped_overlays(date_str, media_files, overlay_files, temp_dir)
                 merged_files.update(result)
-                merged_count += len(result) // 2  # Rough count
+                if group_stats['successful'] > 0:
+                    stats['grouped_succeeded'] += 1
+                    stats['total_merged'] += group_stats['successful']
         
         # Mismatched counts - try grouping
         elif len(overlay_files) > 1 and len(media_files) > 1:
-            result = process_grouped_overlays(date_str, media_files, overlay_files, temp_dir)
+            stats['grouped_attempted'] += 1
+            result, group_stats = process_grouped_overlays(date_str, media_files, overlay_files, temp_dir)
             merged_files.update(result)
-            merged_count += len(result) // 2
+            if group_stats['successful'] > 0:
+                stats['grouped_succeeded'] += 1
+                stats['total_merged'] += group_stats['successful']
     
-    logger.info(f"Successfully merged {merged_count} overlay pairs/groups")
-    return merged_files
+    # Log statistics
+    logger.info("=" * 60)
+    logger.info("OVERLAY MERGING RESULTS:")
+    
+    if stats['simple_pairs_attempted'] > 0:
+        pct = (stats['simple_pairs_succeeded'] / stats['simple_pairs_attempted']) * 100
+        logger.info(f"  Simple pairs: [{stats['simple_pairs_succeeded']}]/[{stats['simple_pairs_attempted']}] ({pct:.1f}%)")
+    
+    if stats['multipart_attempted'] > 0:
+        pct = (stats['multipart_succeeded'] / stats['multipart_attempted']) * 100
+        logger.info(f"  Multipart folders: [{stats['multipart_succeeded']}]/[{stats['multipart_attempted']}] ({pct:.1f}%)")
+    
+    if stats['grouped_attempted'] > 0:
+        pct = (stats['grouped_succeeded'] / stats['grouped_attempted']) * 100
+        logger.info(f"  Grouped folders: [{stats['grouped_succeeded']}]/[{stats['grouped_attempted']}] ({pct:.1f}%)")
+    
+    logger.info(f"  Total merged operations: {stats['total_merged']}")
+    
+    if stats['ffmpeg_errors']:
+        logger.warning(f"  FFmpeg errors on {len(stats['ffmpeg_errors'])} files")
+    
+    logger.info("=" * 60)
+    
+    return merged_files, stats
 
-def process_multipart(date_str: str, media_files: List[Path], overlay_file: Path, temp_dir: Path) -> Optional[str]:
-    """Process multi-part video with identical overlay."""
+def process_multipart(date_str: str, media_files: List[Path], overlay_file: Path, temp_dir: Path) -> Tuple[Optional[str], Dict[str, int]]:
+    """Process multi-part video with identical overlay using a process pool. Returns folder name and statistics."""
     media_files_sorted = sorted(media_files, key=lambda x: x.name)
     folder_name = media_files_sorted[-1].stem + "_multipart"
     folder_path = temp_dir / folder_name
     
+    stats = {'attempted': len(media_files), 'successful': 0, 'failed': 0}
+    
     try:
         ensure_directory(folder_path)
+        
+        tasks = [
+            (media_file, overlay_file, folder_path / media_file.name)
+            for media_file in media_files_sorted
+        ]
+        
+        logger.info(f"Processing multipart group: {folder_name} with {len(tasks)} files")
+        
         timestamps = {}
-        successful = 0
         
-        for media_file in media_files_sorted:
-            output_path = folder_path / media_file.name
-            if run_ffmpeg_merge(media_file, overlay_file, output_path):
-                successful += 1
-                timestamp = extract_mp4_timestamp(media_file)
+        num_processes = max(1, cpu_count() - 1)
+        with Pool(processes=num_processes) as pool:
+            results = pool.map(_ffmpeg_worker, tasks)
+
+        for result in results:
+            if result:
+                stats['successful'] += 1
+                filename, timestamp = result
                 if timestamp:
-                    timestamps[media_file.name] = format_timestamp(timestamp)
+                    timestamps[filename] = format_timestamp(timestamp)
+            else:
+                stats['failed'] += 1
         
-        if successful > 0:
-            with open(folder_path / "timestamps.json", 'w') as f:
+        success_pct = (stats['successful'] / stats['attempted']) * 100 if stats['attempted'] > 0 else 0
+        logger.info(f"  Multipart merging: [{stats['successful']}]/[{stats['attempted']}] ({success_pct:.1f}%) - {folder_name}")
+        
+        if stats['successful'] > 0:
+            with open(folder_path / "timestamps.json", 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
-            logger.info(f"Created multi-part folder: {folder_name}")
-            return folder_name
+            return folder_name, stats
+        else:
+            logger.warning(f"  All merges failed for multipart {folder_name}")
+            if folder_path.exists():
+                shutil.rmtree(folder_path)
+
     except Exception as e:
         logger.error(f"Error processing multi-part for {date_str}: {e}")
+        if folder_path.exists():
+            shutil.rmtree(folder_path)
     
-    if folder_path.exists():
-        shutil.rmtree(folder_path)
-    return None
+    return None, stats
 
-def process_grouped_overlays(date_str: str, media_files: List[Path], overlay_files: List[Path], temp_dir: Path) -> Set[str]:
-    """Process groups of overlays and media files."""
+def process_grouped_overlays(date_str: str, media_files: List[Path], overlay_files: List[Path], temp_dir: Path) -> Tuple[Set[str], Dict[str, int]]:
+    """Process groups of overlays and media files. Returns merged files and statistics."""
     merged = set()
+    stats = {'attempted': 0, 'successful': 0, 'failed': 0}
     
     # Group overlays by hash
     overlay_groups = defaultdict(list)
@@ -201,62 +289,96 @@ def process_grouped_overlays(date_str: str, media_files: List[Path], overlay_fil
         if current_group:
             media_groups.append(current_group)
     
+    logger.info(f"Processing grouped overlays: {len(media_groups)} media groups, {len(overlay_groups)} overlay groups")
+    
     # Match groups by count
     overlay_list = list(overlay_groups.values())
     
     for media_group in media_groups:
         for i, overlay_group in enumerate(overlay_list):
             if len(media_group) == len(overlay_group):
+                stats['attempted'] += len(media_group)
+                
                 if len(media_group) == 1:
                     # Single pair
                     output = temp_dir / media_group[0].name
                     if run_ffmpeg_merge(media_group[0], overlay_group[0], output):
                         merged.add(media_group[0].name)
                         merged.add(overlay_group[0].name)
+                        stats['successful'] += 1
+                    else:
+                        stats['failed'] += 1
                 else:
                     # Multi-file group
-                    folder_name = create_grouped_folder(media_group, overlay_group, temp_dir)
+                    folder_name, folder_stats = create_grouped_folder(media_group, overlay_group, temp_dir)
                     if folder_name:
                         for f in media_group + overlay_group:
                             merged.add(f.name)
+                        stats['successful'] += folder_stats['successful']
+                        stats['failed'] += folder_stats['failed']
                 
                 overlay_list.pop(i)
                 break
     
-    return merged
+    if stats['attempted'] > 0:
+        success_pct = (stats['successful'] / stats['attempted']) * 100
+        logger.info(f"  Grouped processing: [{stats['successful']}]/[{stats['attempted']}] ({success_pct:.1f}%)")
+    
+    return merged, stats
 
-def create_grouped_folder(media_files: List[Path], overlay_files: List[Path], temp_dir: Path) -> Optional[str]:
-    """Create folder for grouped media/overlay pairs."""
+def create_grouped_folder(media_files: List[Path], overlay_files: List[Path], temp_dir: Path) -> Tuple[Optional[str], Dict[str, int]]:
+    """Create folder for grouped media/overlay pairs using a process pool. Returns folder name and statistics."""
     media_sorted = sorted(media_files, key=lambda x: x.name)
     overlay_sorted = sorted(overlay_files, key=lambda x: x.name)
     
     folder_name = media_sorted[-1].stem + "_grouped"
     folder_path = temp_dir / folder_name
     
+    stats = {'attempted': len(media_files), 'successful': 0, 'failed': 0}
+    
     try:
         ensure_directory(folder_path)
+
+        tasks = [
+            (media, overlay, folder_path / media.name)
+            for media, overlay in zip(media_sorted, overlay_sorted)
+        ]
+
+        logger.info(f"Processing grouped folder: {folder_name} with {len(tasks)} files")
+
         timestamps = {}
-        successful = 0
         
-        for media, overlay in zip(media_sorted, overlay_sorted):
-            output_path = folder_path / media.name
-            if run_ffmpeg_merge(media, overlay, output_path):
-                successful += 1
-                timestamp = extract_mp4_timestamp(media)
+        num_processes = max(1, cpu_count() - 1)
+        with Pool(processes=num_processes) as pool:
+            results = pool.map(_ffmpeg_worker, tasks)
+
+        for result in results:
+            if result:
+                stats['successful'] += 1
+                filename, timestamp = result
                 if timestamp:
-                    timestamps[media.name] = format_timestamp(timestamp)
+                    timestamps[filename] = format_timestamp(timestamp)
+            else:
+                stats['failed'] += 1
         
-        if successful > 0:
-            with open(folder_path / "timestamps.json", 'w') as f:
+        success_pct = (stats['successful'] / stats['attempted']) * 100 if stats['attempted'] > 0 else 0
+        logger.info(f"  Grouped merging: [{stats['successful']}]/[{stats['attempted']}] ({success_pct:.1f}%) - {folder_name}")
+        
+        if stats['successful'] > 0:
+            with open(folder_path / "timestamps.json", 'w', encoding='utf-8') as f:
                 json.dump(timestamps, f, indent=2)
-            logger.info(f"Created grouped folder: {folder_name}")
-            return folder_name
+            return folder_name, stats
+        else:
+            logger.warning(f"  All merges failed for grouped {folder_name}")
+            if folder_path.exists():
+                shutil.rmtree(folder_path)
+
     except Exception as e:
         logger.error(f"Error creating grouped folder: {e}")
-    
-    if folder_path.exists():
-        shutil.rmtree(folder_path)
-    return None
+        if folder_path.exists():
+            shutil.rmtree(folder_path)
+            
+    return None, stats
 
 def extract_media_id(filename: str) -> Optional[str]:
     """Extract media ID from filename."""
@@ -278,43 +400,73 @@ def extract_media_id(filename: str) -> Optional[str]:
     
     return None
 
-def get_media_type_from_extension(filename: str) -> Optional[str]:
-    """Determine Snapchat media type from file extension."""
-    ext = Path(filename).suffix.lower()
+def index_media_files(media_dir: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
+    """Create index of media ID to filename. Returns index and statistics."""
+    logger.info("=" * 60)
+    logger.info("Starting MEDIA INDEXING phase")
+    logger.info("=" * 60)
     
-    # Image types
-    if ext in ['.jpeg', '.jpg', '.png', '.webp']:
-        return "IMAGE"
-    
-    # Video types
-    if ext in ['.mp4', '.mov']:
-        return "VIDEO"
-    
-    return None
-
-def index_media_files(media_dir: Path) -> Dict[str, str]:
-    """Create index of media ID to filename."""
-    logger.info(f"Indexing media files in {media_dir}")
     media_index = {}
+    stats = {
+        'total_files': 0,
+        'regular_files': 0,
+        'multipart_folders': 0,
+        'grouped_folders': 0,
+        'extracted_ids': 0,
+        'no_id_files': []
+    }
     
     if not media_dir.exists():
-        return {}
+        logger.warning(f"Media directory {media_dir} does not exist")
+        return {}, stats
     
     for item in media_dir.iterdir():
         if item.is_file():
+            stats['total_files'] += 1
+            stats['regular_files'] += 1
             media_id = extract_media_id(item.name)
             if media_id:
                 media_index[media_id] = item.name
+                stats['extracted_ids'] += 1
+            else:
+                stats['no_id_files'].append(item.name)
+                
         elif item.is_dir() and (item.name.endswith("_multipart") or item.name.endswith("_grouped")):
+            if item.name.endswith("_multipart"):
+                stats['multipart_folders'] += 1
+            else:
+                stats['grouped_folders'] += 1
+                
             # Index files in folder
             for file_path in item.iterdir():
                 if file_path.suffix.lower() == '.mp4':
+                    stats['total_files'] += 1
                     media_id = extract_media_id(file_path.name)
                     if media_id:
                         media_index[media_id] = item.name  # Map to folder
+                        stats['extracted_ids'] += 1
+                    else:
+                        stats['no_id_files'].append(file_path.name)
     
-    logger.info(f"Indexed {len(media_index)} media items")
-    return media_index
+    # Log statistics
+    logger.info("MEDIA INDEXING RESULTS:")
+    logger.info(f"  Total files processed: {stats['total_files']}")
+    logger.info(f"    - Regular files: {stats['regular_files']}")
+    logger.info(f"    - Files in multipart folders: {stats['multipart_folders']}")
+    logger.info(f"    - Files in grouped folders: {stats['grouped_folders']}")
+    
+    if stats['total_files'] > 0:
+        success_pct = (stats['extracted_ids'] / stats['total_files']) * 100
+        logger.info(f"  Media ID extraction: [{stats['extracted_ids']}]/[{stats['total_files']}] ({success_pct:.1f}%)")
+    
+    if stats['no_id_files'] and len(stats['no_id_files']) <= 10:
+        logger.debug(f"  Files without extractable IDs: {stats['no_id_files'][:10]}")
+    elif stats['no_id_files']:
+        logger.debug(f"  {len(stats['no_id_files'])} files without extractable IDs (showing first 10)")
+    
+    logger.info("=" * 60)
+    
+    return media_index, stats
 
 def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
     """Extract creation timestamp from MP4 file."""
@@ -350,18 +502,38 @@ def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
         return None
 
 def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str, str], 
-                         media_dir: Path) -> Tuple[Dict, Set[str]]:
-    """Map media files to conversation messages."""
-    logger.info("Mapping media to messages")
+                         media_dir: Path) -> Tuple[Dict, Set[str], Dict[str, Any]]:
+    """Map media files to conversation messages. Returns mappings, mapped files, and statistics."""
+    logger.info("=" * 60)
+    logger.info("Starting MEDIA MAPPING phase")
+    logger.info("=" * 60)
+    
     mappings = defaultdict(dict)
     mapped_files = set()
     
+    stats = {
+        'total_messages_with_media_ids': 0,
+        'media_ids_found': 0,
+        'media_ids_not_found': 0,
+        'mapped_by_id': 0,
+        'mapped_by_timestamp': 0,
+        'mp4s_with_timestamp': 0,
+        'mp4s_without_timestamp': 0,
+        'timestamp_matches': 0,
+        'folders_mapped': 0,
+        'unmapped_files': 0
+    }
+    
     # Phase 1: Map by Media ID
+    logger.info("Phase 1: Mapping by Media ID...")
+    
     for conv_id, messages in conversations.items():
         for i, msg in enumerate(messages):
             media_ids_str = msg.get("Media IDs", "")
             if not media_ids_str:
                 continue
+            
+            stats['total_messages_with_media_ids'] += 1
             
             for media_id in media_ids_str.split('|'):
                 media_id = media_id.strip()
@@ -378,10 +550,18 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                         "is_grouped": is_grouped
                     })
                     mapped_files.add(filename)
+                    stats['media_ids_found'] += 1
+                    stats['mapped_by_id'] += 1
+                else:
+                    stats['media_ids_not_found'] += 1
     
-    logger.info(f"Mapped {len(mapped_files)} files using Media IDs")
+    if stats['total_messages_with_media_ids'] > 0:
+        found_pct = (stats['media_ids_found'] / (stats['media_ids_found'] + stats['media_ids_not_found'])) * 100 if (stats['media_ids_found'] + stats['media_ids_not_found']) > 0 else 0
+        logger.info(f"  Media ID mapping: [{stats['media_ids_found']}]/[{stats['media_ids_found'] + stats['media_ids_not_found']}] ({found_pct:.1f}%)")
     
     # Phase 2: Map by timestamp
+    logger.info("Phase 2: Mapping by timestamp...")
+    
     unmapped_mp4s = []
     unmapped_folders = []
     
@@ -391,6 +571,8 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 unmapped_mp4s.append(item)
             elif item.is_dir() and (item.name.endswith("_multipart") or item.name.endswith("_grouped")):
                 unmapped_folders.append(item)
+    
+    logger.info(f"  Found {len(unmapped_mp4s)} unmapped MP4 files and {len(unmapped_folders)} unmapped folders")
     
     # Build message timestamp index
     msg_timestamps = []
@@ -405,6 +587,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     for mp4_file in unmapped_mp4s:
         timestamp = extract_mp4_timestamp(mp4_file)
         if timestamp:
+            stats['mp4s_with_timestamp'] += 1
             best_match = None
             min_diff = float('inf')
             
@@ -426,6 +609,10 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     "is_grouped": False
                 })
                 mapped_files.add(mp4_file.name)
+                stats['mapped_by_timestamp'] += 1
+                stats['timestamp_matches'] += 1
+        else:
+            stats['mp4s_without_timestamp'] += 1
     
     # Map folders by timestamp
     for folder in unmapped_folders:
@@ -464,61 +651,32 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     "is_grouped": True
                 })
                 mapped_files.add(folder.name)
+                stats['folders_mapped'] += 1
+                stats['mapped_by_timestamp'] += 1
     
-    # Phase 3: Map by date correlation (1:1 matching on same day)
-    logger.info("Phase 3: Attempting date-based correlation for remaining orphans")
-    
-    # Group unmapped b~ files by date
-    unmapped_by_date = defaultdict(list)
+    # Calculate unmapped
+    all_media_count = len(unmapped_mp4s) + len(unmapped_folders)
     for item in media_dir.iterdir():
-        if item.name not in mapped_files and item.is_file():
-            # Only process b~ files
-            if 'b~' in item.name:
-                match = re.match(r'(\d{4}-\d{2}-\d{2})', item.name)
-                if match:
-                    date_str = match.group(1)
-                    unmapped_by_date[date_str].append(item)
+        if item.is_file() and item.name in mapped_files:
+            all_media_count += 1
     
-    # For each date with exactly ONE b~ file
-    date_correlations = 0
-    for date_str, files in unmapped_by_date.items():
-        if len(files) == 1:
-            media_file = files[0]
-            media_type = get_media_type_from_extension(media_file.name)
-            
-            if media_type:
-                # Find all snaps on this date with matching media type
-                matching_snaps = []
-                
-                for conv_id, messages in conversations.items():
-                    for i, msg in enumerate(messages):
-                        # Check if it's a snap with matching date and type
-                        if msg.get("Type") == "snap":
-                            created = msg.get("Created", "")
-                            if date_str in created:  # Date matches
-                                if msg.get("Media Type") == media_type:
-                                    matching_snaps.append((conv_id, i, msg))
-                
-                # If exactly ONE snap matches, create mapping
-                if len(matching_snaps) == 1:
-                    conv_id, msg_idx, snap = matching_snaps[0]
-                    
-                    if msg_idx not in mappings[conv_id]:
-                        mappings[conv_id][msg_idx] = []
-                    
-                    mappings[conv_id][msg_idx].append({
-                        "filename": media_file.name,
-                        "mapping_method": "date_correlation",
-                        "confidence": "high",
-                        "is_grouped": False
-                    })
-                    mapped_files.add(media_file.name)
-                    date_correlations += 1
-                    
-                    logger.info(f"Date correlation: {media_file.name} → {snap.get('From', 'unknown')} ({date_str})")
+    stats['unmapped_files'] = all_media_count - len(mapped_files) if all_media_count > len(mapped_files) else 0
     
-    if date_correlations > 0:
-        logger.info(f"Successfully mapped {date_correlations} files using date correlation")
+    # Log timestamp mapping statistics
+    if len(unmapped_mp4s) > 0:
+        ts_extract_pct = (stats['mp4s_with_timestamp'] / len(unmapped_mp4s)) * 100
+        logger.info(f"  Timestamp extraction: [{stats['mp4s_with_timestamp']}]/[{len(unmapped_mp4s)}] MP4s ({ts_extract_pct:.1f}%)")
     
-    logger.info(f"Total files mapped: {len(mapped_files)}")
-    return dict(mappings), mapped_files
+    if stats['mp4s_with_timestamp'] + len(unmapped_folders) > 0:
+        ts_match_pct = (stats['timestamp_matches'] + stats['folders_mapped']) / (stats['mp4s_with_timestamp'] + len(unmapped_folders)) * 100
+        logger.info(f"  Timestamp matching: [{stats['timestamp_matches'] + stats['folders_mapped']}]/[{stats['mp4s_with_timestamp'] + len(unmapped_folders)}] ({ts_match_pct:.1f}%)")
+    
+    logger.info("MEDIA MAPPING RESULTS:")
+    logger.info(f"  Total mapped: {len(mapped_files)} files")
+    logger.info(f"    - By Media ID: {stats['mapped_by_id']}")
+    logger.info(f"    - By timestamp: {stats['mapped_by_timestamp']}")
+    logger.info(f"  Unmapped: {stats['unmapped_files']} files")
+    
+    logger.info("=" * 60)
+    
+    return mappings, mapped_files, stats
