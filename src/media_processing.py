@@ -278,6 +278,20 @@ def extract_media_id(filename: str) -> Optional[str]:
     
     return None
 
+def get_media_type_from_extension(filename: str) -> Optional[str]:
+    """Determine Snapchat media type from file extension."""
+    ext = Path(filename).suffix.lower()
+    
+    # Image types
+    if ext in ['.jpeg', '.jpg', '.png', '.webp']:
+        return "IMAGE"
+    
+    # Video types
+    if ext in ['.mp4', '.mov']:
+        return "VIDEO"
+    
+    return None
+
 def index_media_files(media_dir: Path) -> Dict[str, str]:
     """Create index of media ID to filename."""
     logger.info(f"Indexing media files in {media_dir}")
@@ -450,6 +464,61 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                     "is_grouped": True
                 })
                 mapped_files.add(folder.name)
+    
+    # Phase 3: Map by date correlation (1:1 matching on same day)
+    logger.info("Phase 3: Attempting date-based correlation for remaining orphans")
+    
+    # Group unmapped b~ files by date
+    unmapped_by_date = defaultdict(list)
+    for item in media_dir.iterdir():
+        if item.name not in mapped_files and item.is_file():
+            # Only process b~ files
+            if 'b~' in item.name:
+                match = re.match(r'(\d{4}-\d{2}-\d{2})', item.name)
+                if match:
+                    date_str = match.group(1)
+                    unmapped_by_date[date_str].append(item)
+    
+    # For each date with exactly ONE b~ file
+    date_correlations = 0
+    for date_str, files in unmapped_by_date.items():
+        if len(files) == 1:
+            media_file = files[0]
+            media_type = get_media_type_from_extension(media_file.name)
+            
+            if media_type:
+                # Find all snaps on this date with matching media type
+                matching_snaps = []
+                
+                for conv_id, messages in conversations.items():
+                    for i, msg in enumerate(messages):
+                        # Check if it's a snap with matching date and type
+                        if msg.get("Type") == "snap":
+                            created = msg.get("Created", "")
+                            if date_str in created:  # Date matches
+                                if msg.get("Media Type") == media_type:
+                                    matching_snaps.append((conv_id, i, msg))
+                
+                # If exactly ONE snap matches, create mapping
+                if len(matching_snaps) == 1:
+                    conv_id, msg_idx, snap = matching_snaps[0]
+                    
+                    if msg_idx not in mappings[conv_id]:
+                        mappings[conv_id][msg_idx] = []
+                    
+                    mappings[conv_id][msg_idx].append({
+                        "filename": media_file.name,
+                        "mapping_method": "date_correlation",
+                        "confidence": "high",
+                        "is_grouped": False
+                    })
+                    mapped_files.add(media_file.name)
+                    date_correlations += 1
+                    
+                    logger.info(f"Date correlation: {media_file.name} → {snap.get('From', 'unknown')} ({date_str})")
+    
+    if date_correlations > 0:
+        logger.info(f"Successfully mapped {date_correlations} files using date correlation")
     
     logger.info(f"Total files mapped: {len(mapped_files)}")
     return dict(mappings), mapped_files
