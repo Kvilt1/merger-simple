@@ -6,15 +6,13 @@ import logging
 import shutil
 import sys
 from pathlib import Path
-from typing import Dict, Set
+from typing import Set
 
 from config import (
     INPUT_DIR,
     OUTPUT_DIR,
     ensure_directory,
     load_json,
-    save_json,
-    sanitize_filename,
     logger
 )
 
@@ -27,10 +25,10 @@ from media_processing import (
 from conversation import (
     merge_conversations,
     process_friends_data,
-    determine_account_owner,
-    create_conversation_metadata,
-    get_conversation_folder_name
+    determine_account_owner
 )
+
+from day_index_converter import convert_from_memory
 
 def find_export_folder(input_dir: Path) -> Path:
     """Find Snapchat export folder."""
@@ -70,85 +68,6 @@ def copy_unmerged_files(source_dir: Path, temp_dir: Path, merged_files: Set[str]
     
     return copied
 
-def process_conversation_media(conv_id: str, messages: list, mapping: dict, 
-                             conv_dir: Path, temp_dir: Path) -> None:
-    """Copy media files for a conversation."""
-    if not mapping:
-        return
-    
-    media_dir = conv_dir / "media"
-    ensure_directory(media_dir)
-    
-    for msg_idx, items in mapping.items():
-        if msg_idx >= len(messages):
-            continue
-        
-        media_locations = []
-        matched_files = []
-        
-        for item in items:
-            filename = item["filename"]
-            is_grouped = item.get("is_grouped", False)
-            
-            source = temp_dir / filename
-            dest = media_dir / filename
-            
-            if source.exists() and not dest.exists():
-                try:
-                    if source.is_file():
-                        shutil.copy(source, dest)
-                        matched_files.append(filename)
-                    elif source.is_dir():
-                        shutil.copytree(source, dest)
-                        # List files in folder
-                        for f in source.iterdir():
-                            if f.is_file() and f.name != "timestamps.json":
-                                matched_files.append(f.name)
-                except Exception as e:
-                    logger.error(f"Error copying {filename}: {e}")
-            
-            # Add location reference
-            location = f"media/{filename}/" if is_grouped else f"media/{filename}"
-            media_locations.append(location)
-        
-        # Update message
-        messages[msg_idx]["media_locations"] = media_locations
-        messages[msg_idx]["matched_media_files"] = matched_files
-        messages[msg_idx]["is_grouped"] = items[0].get("is_grouped", False)
-        messages[msg_idx]["mapping_method"] = items[0].get("mapping_method")
-        
-        time_diff = items[0].get("time_diff_seconds")
-        if time_diff is not None:
-            messages[msg_idx]["time_diff_seconds"] = time_diff
-
-def handle_orphaned_media(temp_dir: Path, output_dir: Path, mapped_files: Set[str]) -> int:
-    """Copy orphaned media to separate directory. Returns count of orphaned items."""
-    orphaned_dir = output_dir / "orphaned"
-    ensure_directory(orphaned_dir)
-    
-    orphaned_count = 0
-    
-    for item in temp_dir.iterdir():
-        # Skip mapped files, thumbnails, and overlays
-        if item.name in mapped_files:
-            continue
-        if "thumbnail" in item.name.lower():
-            continue
-        if "_overlay~" in item.name:
-            continue
-        
-        try:
-            if item.is_file():
-                shutil.copy(item, orphaned_dir / item.name)
-                orphaned_count += 1
-            elif item.is_dir() and (item.name.endswith("_multipart") or item.name.endswith("_grouped")):
-                shutil.copytree(item, orphaned_dir / item.name)
-                orphaned_count += 1
-        except Exception as e:
-            logger.error(f"Error copying orphaned {item.name}: {e}")
-    
-    logger.info(f"Copied {orphaned_count} orphaned items")
-    return orphaned_count
 
 def main():
     """Main processing function."""
@@ -160,6 +79,8 @@ def main():
     parser.add_argument("--output", type=Path, default=OUTPUT_DIR, help="Output directory")
     parser.add_argument("--no-clean", action="store_true", help="Don't clean output directory")
     parser.add_argument("--log-level", default="INFO", help="Logging level")
+    parser.add_argument("--no-hash", action="store_true", 
+                       help="Keep original filenames in media pool (disables deduplication)")
     args = parser.parse_args()
     
     # Setup logging
@@ -237,7 +158,7 @@ def main():
         media_index, index_stats = index_media_files(temp_media_dir)
         all_stats['index'] = index_stats
         
-        mappings, mapped_files, mapping_stats = map_media_to_messages(conversations, media_index, temp_media_dir)
+        mappings, _, mapping_stats = map_media_to_messages(conversations, media_index, temp_media_dir)
         all_stats['mapping'] = mapping_stats
         phase_times['media_mapping'] = time.time() - phase_start
         
@@ -249,50 +170,26 @@ def main():
         
         ensure_directory(args.output)
         
-        conversation_count = 0
-        for conv_id, messages in conversations.items():
-            if not messages:
-                continue
-            
-            # Create metadata
-            metadata = create_conversation_metadata(conv_id, messages, friends_map, account_owner)
-            
-            # Create output directory
-            folder_name = get_conversation_folder_name(metadata, messages)
-            folder_name = sanitize_filename(folder_name)
-            
-            is_group = metadata["conversation_type"] == "group"
-            base_dir = args.output / "groups" if is_group else args.output / "conversations"
-            conv_dir = base_dir / folder_name
-            ensure_directory(conv_dir)
-            
-            # Process media
-            process_conversation_media(
-                conv_id, messages, mappings.get(conv_id, {}), 
-                conv_dir, temp_media_dir
-            )
-            
-            # Save conversation data
-            save_json({
-                "conversation_metadata": metadata,
-                "messages": messages
-            }, conv_dir / "conversation.json")
-            
-            conversation_count += 1
+        # Use the day-index format
+        converter_stats = convert_from_memory(
+            conversations=conversations,
+            friends_map=friends_map,
+            account_owner=account_owner,
+            mappings=mappings,
+            temp_media_dir=temp_media_dir,
+            output_dir=args.output,
+            use_hash=not args.no_hash,
+            max_workers=4
+        )
         
-        logger.info(f"Organized {conversation_count} conversations")
+        # Add converter stats to all_stats
+        all_stats['conversations'] = converter_stats.get('total_conversations', 0)
+        all_stats['events'] = converter_stats.get('total_events', 0)
+        all_stats['days'] = converter_stats.get('total_days', 0)
+        all_stats['orphaned'] = converter_stats.get('orphaned_media', 0)
+        
+        logger.info(f"Organized {converter_stats['total_conversations']} conversations into {converter_stats['total_days']} days")
         phase_times['output_organization'] = time.time() - phase_start
-        
-        # ORPHANED MEDIA PHASE
-        phase_start = time.time()
-        logger.info("=" * 60)
-        logger.info("PHASE: ORPHANED MEDIA PROCESSING")
-        logger.info("=" * 60)
-        
-        orphaned_count = handle_orphaned_media(temp_media_dir, args.output, mapped_files)
-        all_stats['orphaned'] = orphaned_count
-        logger.info(f"Processed {orphaned_count} orphaned media files")
-        phase_times['orphaned_processing'] = time.time() - phase_start
         
         # CLEANUP PHASE
         phase_start = time.time()
@@ -332,6 +229,12 @@ def main():
         logger.info(f"  - Mapped by timestamp:             {all_stats['mapping'].get('mapped_by_timestamp', 0)}")
         logger.info(f"  - Total mapped:                    {total_mapped}")
         logger.info(f"  - Orphaned (unmapped):             {all_stats.get('orphaned', 0)}")
+        
+        logger.info("")
+        logger.info("Day-Index Output:")
+        logger.info(f"  - Total conversations:             {all_stats.get('conversations', 0)}")
+        logger.info(f"  - Total events:                    {all_stats.get('events', 0)}")
+        logger.info(f"  - Days with activity:              {all_stats.get('days', 0)}")
         
         if total_processed > 0:
             map_pct = (total_mapped / total_processed) * 100
