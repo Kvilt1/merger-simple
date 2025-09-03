@@ -1,7 +1,0 @@
-# Core dependencies
-ijson>=3.2.0     # Streaming JSON parser for memory-efficient processing
-tqdm>=4.65.0     # Progress bars and time tracking
-psutil>=5.9.0    # System resource monitoring and CPU detection
-
-# Optional for additional features
-# numpy>=1.24.0   # If needed for efficient array operations

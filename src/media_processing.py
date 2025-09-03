@@ -19,14 +19,33 @@ from config import (
     ensure_directory,
     format_timestamp
 )
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 
-def _ffmpeg_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[int]]]:
+def parse_iso_timestamp(iso_str: str) -> datetime:
+    """Parse ISO timestamp string to datetime object."""
+    if iso_str.endswith('Z'):
+        iso_str = iso_str[:-1] + '+00:00'
+    return datetime.fromisoformat(iso_str)
+
+def iso_to_ms(iso_str: str) -> int:
+    """Convert ISO timestamp string to milliseconds."""
+    dt = parse_iso_timestamp(iso_str)
+    return int(dt.timestamp() * 1000)
+
+def get_timestamp_diff_seconds(iso1: str, iso2: str) -> float:
+    """Calculate difference in seconds between two ISO timestamps."""
+    dt1 = parse_iso_timestamp(iso1)
+    dt2 = parse_iso_timestamp(iso2)
+    return abs((dt1 - dt2).total_seconds())
+
+
+def _ffmpeg_worker(args: Tuple[Path, Path, Path]) -> Optional[Tuple[str, Optional[str]]]:
     """
     A picklable top-level worker function for FFmpeg merging.
-    On success, returns the original media filename and its extracted timestamp.
+    On success, returns the original media filename and its extracted ISO timestamp.
     """
     media_file, overlay_file, output_path = args
     if run_ffmpeg_merge(media_file, overlay_file, output_path):
@@ -229,7 +248,7 @@ def process_multipart(date_str: str, media_files: List[Path], overlay_file: Path
                 stats['successful'] += 1
                 filename, timestamp = result
                 if timestamp:
-                    timestamps[filename] = format_timestamp(timestamp)
+                    timestamps[filename] = timestamp  # Already in ISO format
             else:
                 stats['failed'] += 1
         
@@ -279,7 +298,7 @@ def process_grouped_overlays(date_str: str, media_files: List[Path], overlay_fil
         current_ts = media_with_ts[0][1]
         
         for media, ts in media_with_ts[1:]:
-            if abs(ts - current_ts) <= TIMESTAMP_THRESHOLD_SECONDS * 1000:
+            if get_timestamp_diff_seconds(ts, current_ts) <= TIMESTAMP_THRESHOLD_SECONDS:
                 current_group.append(media)
             else:
                 media_groups.append(current_group)
@@ -357,7 +376,7 @@ def create_grouped_folder(media_files: List[Path], overlay_files: List[Path], te
                 stats['successful'] += 1
                 filename, timestamp = result
                 if timestamp:
-                    timestamps[filename] = format_timestamp(timestamp)
+                    timestamps[filename] = timestamp  # Already in ISO format
             else:
                 stats['failed'] += 1
         
@@ -468,8 +487,8 @@ def index_media_files(media_dir: Path) -> Tuple[Dict[str, str], Dict[str, int]]:
     
     return media_index, stats
 
-def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
-    """Extract creation timestamp from MP4 file."""
+def extract_mp4_timestamp(mp4_path: Path) -> Optional[str]:
+    """Extract creation timestamp from MP4 file and return as ISO format string."""
     try:
         with open(mp4_path, "rb") as f:
             while True:
@@ -491,7 +510,8 @@ def extract_mp4_timestamp(mp4_path: Path) -> Optional[int]:
                         else:
                             creation_time = struct.unpack('>Q', f.read(8))[0]
                         
-                        return (creation_time - QUICKTIME_EPOCH_ADJUSTER) * 1000
+                        timestamp_ms = (creation_time - QUICKTIME_EPOCH_ADJUSTER) * 1000
+                        return format_timestamp(timestamp_ms)
                     return None
                 
                 if size == 1:
@@ -574,30 +594,50 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     
     logger.info(f"  Found {len(unmapped_mp4s)} unmapped MP4 files and {len(unmapped_folders)} unmapped folders")
     
-    # Build message timestamp index
+    # Build message timestamp index with ISO format
     msg_timestamps = []
     for conv_id, messages in conversations.items():
         for i, msg in enumerate(messages):
-            ts = int(msg.get("Created(microseconds)", 0))
-            if ts > 0:
-                msg_timestamps.append((conv_id, i, ts))
+            # Try to get ISO timestamp directly or convert from milliseconds
+            iso_ts = None
+            if msg.get("Created"):
+                # Parse "Created" field if it exists (format: "2025-07-18 15:38:47 UTC")
+                created_str = msg["Created"]
+                if created_str.endswith(" UTC"):
+                    created_str = created_str[:-4]
+                try:
+                    dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                    iso_ts = dt.isoformat().replace('+00:00', 'Z')
+                except:
+                    pass
+            
+            if not iso_ts:
+                # Fall back to milliseconds field
+                ts_ms = int(msg.get("Created(microseconds)", 0))
+                if ts_ms > 0:
+                    iso_ts = format_timestamp(ts_ms)
+            
+            if iso_ts:
+                msg_timestamps.append((conv_id, i, iso_ts))
+    
+    # Sort by ISO timestamp (string sorting works for ISO format)
     msg_timestamps.sort(key=lambda x: x[2])
     
     # Map MP4s by timestamp
     for mp4_file in unmapped_mp4s:
-        timestamp = extract_mp4_timestamp(mp4_file)
-        if timestamp:
+        iso_timestamp = extract_mp4_timestamp(mp4_file)
+        if iso_timestamp:
             stats['mp4s_with_timestamp'] += 1
             best_match = None
-            min_diff = float('inf')
+            min_diff_seconds = float('inf')
             
-            for conv_id, msg_idx, msg_ts in msg_timestamps:
-                diff = abs(timestamp - msg_ts)
-                if diff < min_diff:
-                    min_diff = diff
+            for conv_id, msg_idx, msg_iso_ts in msg_timestamps:
+                diff_seconds = get_timestamp_diff_seconds(iso_timestamp, msg_iso_ts)
+                if diff_seconds < min_diff_seconds:
+                    min_diff_seconds = diff_seconds
                     best_match = (conv_id, msg_idx)
             
-            if best_match and min_diff <= TIMESTAMP_THRESHOLD_SECONDS * 1000:
+            if best_match and min_diff_seconds <= TIMESTAMP_THRESHOLD_SECONDS:
                 conv_id, msg_idx = best_match
                 if msg_idx not in mappings[conv_id]:
                     mappings[conv_id][msg_idx] = []
@@ -605,7 +645,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 mappings[conv_id][msg_idx].append({
                     "filename": mp4_file.name,
                     "mapping_method": "timestamp",
-                    "time_diff_seconds": round(min_diff / 1000.0, 1),
+                    "time_diff_seconds": round(min_diff_seconds, 1),
                     "is_grouped": False
                 })
                 mapped_files.add(mp4_file.name)
@@ -617,29 +657,29 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
     # Map folders by timestamp
     for folder in unmapped_folders:
         timestamps_file = folder / "timestamps.json"
-        min_timestamp = None
+        min_iso_timestamp = None
         
         if timestamps_file.exists():
             with open(timestamps_file) as f:
                 data = json.load(f)
-                for iso_ts in data.values():
-                    from datetime import datetime
-                    dt = datetime.fromisoformat(iso_ts.replace('Z', '+00:00'))
-                    ts = int(dt.timestamp() * 1000)
-                    if min_timestamp is None or ts < min_timestamp:
-                        min_timestamp = ts
+                # Find the earliest ISO timestamp in the folder
+                iso_timestamps = list(data.values())
+                if iso_timestamps:
+                    # Sort ISO timestamps and take the earliest
+                    iso_timestamps.sort()
+                    min_iso_timestamp = iso_timestamps[0]
         
-        if min_timestamp:
+        if min_iso_timestamp:
             best_match = None
-            min_diff = float('inf')
+            min_diff_seconds = float('inf')
             
-            for conv_id, msg_idx, msg_ts in msg_timestamps:
-                diff = abs(min_timestamp - msg_ts)
-                if diff < min_diff:
-                    min_diff = diff
+            for conv_id, msg_idx, msg_iso_ts in msg_timestamps:
+                diff_seconds = get_timestamp_diff_seconds(min_iso_timestamp, msg_iso_ts)
+                if diff_seconds < min_diff_seconds:
+                    min_diff_seconds = diff_seconds
                     best_match = (conv_id, msg_idx)
             
-            if best_match and min_diff <= TIMESTAMP_THRESHOLD_SECONDS * 1000:
+            if best_match and min_diff_seconds <= TIMESTAMP_THRESHOLD_SECONDS:
                 conv_id, msg_idx = best_match
                 if msg_idx not in mappings[conv_id]:
                     mappings[conv_id][msg_idx] = []
@@ -647,7 +687,7 @@ def map_media_to_messages(conversations: Dict[str, List], media_index: Dict[str,
                 mappings[conv_id][msg_idx].append({
                     "filename": folder.name,
                     "mapping_method": "timestamp",
-                    "time_diff_seconds": round(min_diff / 1000.0, 1),
+                    "time_diff_seconds": round(min_diff_seconds, 1),
                     "is_grouped": True
                 })
                 mapped_files.add(folder.name)

@@ -127,6 +127,7 @@ class Event:
     t_iso: str
     from_user: str | None
     kind: str       # "chat" | "snap" (we default to "chat" unless msg has explicit type)
+    media_type: str | None  # Original Media Type from source JSON (e.g., "VIDEO", "IMAGE", "TEXT", etc.)
     text: str | None
     saved: bool
     media: list     # list of {"path": "/m/<file>", "name": "orig.ext"}
@@ -208,6 +209,7 @@ def normalize_message(conv_id: str, msg_idx: int, msg: dict,
     saved = bool(msg.get("IsSaved"))
     text = msg.get("Content")
     kind = "snap" if (msg.get("Type") == "snap") else "chat"
+    media_type = msg.get("Media Type")  # Extract Media Type from the message
 
     # Expand the media set exactly as your current output indicates
     in_media_files = expand_media_files(conv_root, msg.get("media_locations") or [])
@@ -223,6 +225,7 @@ def normalize_message(conv_id: str, msg_idx: int, msg: dict,
         t_iso=t_iso,
         from_user=from_user,
         kind=kind,
+        media_type=media_type,
         text=text,
         saved=saved,
         media=media_items
@@ -235,6 +238,7 @@ def normalize_message(conv_id: str, msg_idx: int, msg: dict,
         "t_iso": t_iso,
         "from": from_user,
         "kind": kind,
+        "media_type": media_type,
         "text": text,
         "saved": saved,
         "media_paths": [m["path"] for m in media_items],
@@ -253,7 +257,8 @@ def convert_from_memory(conversations: Dict[str, List],
                        temp_media_dir: Path,
                        output_dir: Path,
                        use_hash: bool = True,
-                       max_workers: int = 4) -> Dict[str, Any]:
+                       max_workers: int = 4,
+                       avatars: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
     """
     Convert in-memory conversation data to day-first index format.
     
@@ -271,15 +276,18 @@ def convert_from_memory(conversations: Dict[str, List],
         Dict containing statistics about the conversion
     """
     pool_dir = output_dir / "public" / "m"
-    out_days = output_dir / "days"
-    out_convs = output_dir / "conversations"
-    out_orphans = output_dir / "orphans"
+    avatar_dir = output_dir / "public" / "a"
+    out_data = output_dir / "data"
+    out_days = out_data / "days"
+    out_convs = out_data / "conversations"
+    out_orphans = out_data / "orphans"
     
     # Create output directories
     out_days.mkdir(parents=True, exist_ok=True)
     out_convs.mkdir(parents=True, exist_ok=True)
     out_orphans.mkdir(parents=True, exist_ok=True)
     pool_dir.mkdir(parents=True, exist_ok=True)
+    avatar_dir.mkdir(parents=True, exist_ok=True)
     
     # Statistics tracking
     stats = {
@@ -369,6 +377,7 @@ def convert_from_memory(conversations: Dict[str, List],
                     "t_iso": ev.t_iso,
                     "from": ev.from_user,
                     "kind": ev.kind,
+                    "media_type": ev.media_type,
                     "text": ev.text,
                     "saved": ev.saved,
                     "media": ev.media
@@ -439,6 +448,38 @@ def convert_from_memory(conversations: Dict[str, List],
     stats['orphaned_media'] = orphaned_count
     write_json({"items": orphan_entries}, out_orphans / "index.json")
     
+    # Generate avatar pool and friends.min.json
+    if avatars:
+        logger.info("Generating avatar pool and friends.min.json...")
+        from bitmoji_processing import save_avatar_pool
+        
+        # Save avatars to pool
+        username_to_avatar_path = save_avatar_pool(avatars, avatar_dir)
+        
+        # Build friends.min.json - only include users with avatars
+        friends_min = {}
+        
+        # Process users who have avatars
+        for username, avatar_path in username_to_avatar_path.items():
+            # Get display name from friends_map if available
+            display_name = username
+            if username in friends_map:
+                friend_data = friends_map[username]
+                display_name = friend_data.get("Display Name") or friend_data.get("display_name") or username
+            elif username == account_owner:
+                display_name = "You"
+            
+            friends_min[username] = {
+                "name": display_name,
+                "avatar": avatar_path
+            }
+        
+        # Write friends.min.json
+        write_json(friends_min, out_data / "friends.min.json")
+        logger.info(f"Generated friends.min.json with {len(friends_min)} users")
+        stats['total_friends'] = len(friends_min)
+        stats['total_avatars'] = len(username_to_avatar_path)
+    
     logger.info(f"Conversion complete: {stats['total_events']} events, {stats['total_media']} media items, {stats['total_days']} days")
     
     return stats
@@ -456,6 +497,7 @@ def normalize_message_from_memory(conv_id: str, msg_idx: int, msg: dict,
     saved = bool(msg.get("IsSaved"))
     text = msg.get("Content")
     kind = "snap" if (msg.get("Type") == "snap") else "chat"
+    media_type = msg.get("Media Type")  # Extract Media Type from the message
     
     # Process media files
     media_items = []
@@ -484,6 +526,7 @@ def normalize_message_from_memory(conv_id: str, msg_idx: int, msg: dict,
         t_iso=t_iso,
         from_user=from_user,
         kind=kind,
+        media_type=media_type,
         text=text,
         saved=saved,
         media=media_items
@@ -496,6 +539,7 @@ def normalize_message_from_memory(conv_id: str, msg_idx: int, msg: dict,
         "t_iso": t_iso,
         "from": from_user,
         "kind": kind,
+        "media_type": media_type,
         "text": text,
         "saved": saved,
         "media_paths": [m["path"] for m in media_items],
@@ -510,9 +554,10 @@ def normalize_message_from_memory(conv_id: str, msg_idx: int, msg: dict,
 
 def convert(src: Path, out: Path, use_hash: bool, max_workers: int, do_validate: bool, validate_only: bool):
     pool_dir: Path = out / "public" / "m"
-    out_days = out / "days"
-    out_convs = out / "conversations"
-    out_orphans = out / "orphans"
+    out_data = out / "data"
+    out_days = out_data / "days"
+    out_convs = out_data / "conversations"
+    out_orphans = out_data / "orphans"
 
     if not validate_only:
         out_days.mkdir(parents=True, exist_ok=True)
@@ -574,6 +619,7 @@ def convert(src: Path, out: Path, use_hash: bool, max_workers: int, do_validate:
                         "t_iso": ev.t_iso,
                         "from": ev.from_user,
                         "kind": ev.kind,
+                        "media_type": ev.media_type,
                         "text": ev.text,
                         "saved": ev.saved,
                         "media": ev.media
@@ -640,9 +686,10 @@ def convert(src: Path, out: Path, use_hash: bool, max_workers: int, do_validate:
 def validate_all(src: Path, out: Path, trace: dict, validate_only: bool) -> bool:
     problems = []
 
-    out_days = out / "days"
-    out_convs = out / "conversations"
-    out_orphans = out / "orphans"
+    out_data = out / "data"
+    out_days = out_data / "days"
+    out_convs = out_data / "conversations"
+    out_orphans = out_data / "orphans"
     pool_dir = out / "public" / "m"
 
     # Build actual event map by scanning days/*
@@ -767,7 +814,7 @@ def validate_all(src: Path, out: Path, trace: dict, validate_only: bool) -> bool
         # Build per-day stats from actual files
         for day in days_found:
             y,m,d = day.split("-")
-            j = read_json(out / "days" / y / m / d / "index.json")
+            j = read_json(out_data / "days" / y / m / d / "index.json")
             media_count = sum(len(e.get("media") or []) for e in j.get("events", []))
             gal_count = len(j.get("gallery", []))
             if gal_count != media_count:

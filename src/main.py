@@ -25,10 +25,12 @@ from media_processing import (
 from conversation import (
     merge_conversations,
     process_friends_data,
-    determine_account_owner
+    determine_account_owner,
+    collect_all_usernames
 )
 
 from day_index_converter import convert_from_memory
+from bitmoji_processing import extract_bitmojis
 
 def find_export_folder(input_dir: Path) -> Path:
     """Find Snapchat export folder."""
@@ -147,11 +149,27 @@ def main():
         
         # Process conversations
         conversations = merge_conversations(chat_data, snap_data)
-        friends_map = process_friends_data(friends_json)
+        friends_map, friend_usernames = process_friends_data(friends_json)
         account_owner = determine_account_owner(conversations)
         
         logger.info(f"Loaded {len(conversations)} conversations")
         phase_times['data_loading'] = time.time() - phase_start
+        
+        # BITMOJI EXTRACTION PHASE
+        phase_start = time.time()
+        logger.info("=" * 60)
+        logger.info("PHASE: BITMOJI EXTRACTION")
+        logger.info("=" * 60)
+        
+        # Collect all unique usernames
+        all_usernames = collect_all_usernames(conversations, friends_map)
+        logger.info(f"Found {len(all_usernames)} unique usernames for Bitmoji extraction")
+        
+        # Extract Bitmojis for all users
+        avatars = extract_bitmojis(all_usernames)
+        all_stats['bitmojis'] = len(avatars)
+        logger.info(f"Extracted {len(avatars)} Bitmojis/avatars")
+        phase_times['bitmoji_extraction'] = time.time() - phase_start
         
         # MEDIA INDEXING AND MAPPING PHASE
         phase_start = time.time()
@@ -179,7 +197,8 @@ def main():
             temp_media_dir=temp_media_dir,
             output_dir=args.output,
             use_hash=not args.no_hash,
-            max_workers=4
+            max_workers=4,
+            avatars=avatars
         )
         
         # Add converter stats to all_stats
@@ -235,6 +254,7 @@ def main():
         logger.info(f"  - Total conversations:             {all_stats.get('conversations', 0)}")
         logger.info(f"  - Total events:                    {all_stats.get('events', 0)}")
         logger.info(f"  - Days with activity:              {all_stats.get('days', 0)}")
+        logger.info(f"  - Bitmojis/avatars extracted:      {all_stats.get('bitmojis', 0)}")
         
         if total_processed > 0:
             map_pct = (total_mapped / total_processed) * 100

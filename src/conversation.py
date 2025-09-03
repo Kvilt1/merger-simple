@@ -2,7 +2,7 @@
 
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Any, Optional, Set
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +17,7 @@ def merge_conversations(chat_data: Dict, snap_data: Dict) -> Dict[str, List]:
             merged[conv_id] = []
         for msg in messages:
             msg["Type"] = "message"
+            # Media Type field is already present in chat messages
         merged[conv_id].extend(messages)
     
     # Process snaps
@@ -25,6 +26,7 @@ def merge_conversations(chat_data: Dict, snap_data: Dict) -> Dict[str, List]:
             merged[conv_id] = []
         for snap in snaps:
             snap["Type"] = "snap"
+            # Media Type field is already present in snap messages
         merged[conv_id].extend(snaps)
     
     # Sort by timestamp
@@ -34,25 +36,32 @@ def merge_conversations(chat_data: Dict, snap_data: Dict) -> Dict[str, List]:
     logger.info(f"Merged {len(merged)} conversations")
     return merged
 
-def process_friends_data(friends_json: Dict) -> Dict[str, Dict]:
-    """Process friends data."""
+def process_friends_data(friends_json: Dict) -> Tuple[Dict[str, Dict], Set[str]]:
+    """Process friends data and extract unique usernames."""
     logger.info("Processing friends data")
     friends_map = {}
+    all_usernames = set()
     
     # Active friends
     for friend in friends_json.get("Friends", []):
         friend["friend_status"] = "active"
         friend["friend_list_section"] = "Friends"
-        friends_map[friend["Username"]] = friend
+        username = friend.get("Username")
+        if username:
+            friends_map[username] = friend
+            all_usernames.add(username)
     
     # Deleted friends
     for friend in friends_json.get("Deleted Friends", []):
         friend["friend_status"] = "deleted"
         friend["friend_list_section"] = "Deleted Friends"
-        friends_map[friend["Username"]] = friend
+        username = friend.get("Username")
+        if username:
+            friends_map[username] = friend
+            all_usernames.add(username)
     
-    logger.info(f"Processed {len(friends_map)} friends")
-    return friends_map
+    logger.info(f"Processed {len(friends_map)} friends, {len(all_usernames)} unique usernames")
+    return friends_map, all_usernames
 
 def determine_account_owner(conversations: Dict[str, List]) -> str:
     """Determine account owner from messages."""
@@ -81,8 +90,7 @@ def get_conversation_participants(messages: List[Dict], conv_id: str, owner: str
     if not is_group:
         participants.add(conv_id)
     
-    # Remove owner
-    participants.discard(owner)
+    # Don't remove owner here - we want to track all usernames
     return participants
 
 def create_conversation_metadata(conv_id: str, messages: List[Dict], 
@@ -149,3 +157,24 @@ def get_conversation_folder_name(metadata: Dict, messages: List[Dict]) -> str:
             base_name = metadata["conversation_id"]
     
     return f"{last_date} - {base_name}"
+
+
+def collect_all_usernames(conversations: Dict[str, List], friends_map: Dict[str, Dict]) -> Set[str]:
+    """Collect unique usernames from conversations only."""
+    all_usernames = set()
+    
+    # Add usernames from conversation IDs
+    for conv_id in conversations.keys():
+        # Some conversation IDs are usernames (for individual chats)
+        if not '-' in conv_id:  # UUIDs have dashes, usernames typically don't
+            all_usernames.add(conv_id)
+    
+    # Add usernames from all messages
+    for messages in conversations.values():
+        for msg in messages:
+            sender = msg.get("From")
+            if sender:
+                all_usernames.add(sender)
+    
+    logger.info(f"Collected {len(all_usernames)} unique usernames from conversations")
+    return all_usernames
