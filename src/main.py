@@ -197,7 +197,6 @@ def main():
             temp_media_dir=temp_media_dir,
             output_dir=args.output,
             use_hash=not args.no_hash,
-            max_workers=4,
             avatars=avatars
         )
         
